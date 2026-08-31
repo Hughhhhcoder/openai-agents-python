@@ -516,6 +516,7 @@ async def _terminate_process_group_and_reap_process(
     status_task: asyncio.Task[int] | None = None,
     control_write_fd: int | None = None,
     terminate_write_fd: int | None = None,
+    signal_process_group: bool = True,
 ) -> None:
     cleanup_deadline = asyncio.get_running_loop().time() + _PROCESS_CLEANUP_TIMEOUT_SECONDS
 
@@ -550,7 +551,7 @@ async def _terminate_process_group_and_reap_process(
     # Keep the keeper alive until after the group signal. Closing control first
     # would release the only stable owner of this group and allow its ID to be
     # reused before killpg runs.
-    if group_id is not None:
+    if signal_process_group and group_id is not None:
         with suppress(OSError):
             os.killpg(group_id, signal.SIGKILL)
     # Ask the supervisor to terminate the direct child and, when applicable,
@@ -571,9 +572,14 @@ async def _terminate_process_group_and_reap_process(
         # own reaping protocol. The target PID is still safe to use while the
         # supervisor remains unreaped; ask its requested UID as well when the
         # command was launched through sudo.
-        if target_user is not None and group_id is not None:
+        if signal_process_group and target_user is not None and group_id is not None:
             await _kill_process_as_user(target_user, ("-KILL", f"-{group_id}"))
-        if target_pid is not None and status_task is not None and not status_task.done():
+        if (
+            signal_process_group
+            and target_pid is not None
+            and status_task is not None
+            and not status_task.done()
+        ):
             with suppress(OSError):
                 os.kill(target_pid, signal.SIGKILL)
         if proc.returncode is None:
@@ -621,6 +627,7 @@ async def _terminate_process_group_and_reap(
     status_task: asyncio.Task[int] | None = None,
     control_write_fd: int | None = None,
     terminate_write_fd: int | None = None,
+    signal_process_group: bool = True,
 ) -> None:
     # Keep process cleanup in an owned task so a second cancellation cannot
     # interrupt the drain, direct-child reap, or transport close.
@@ -635,6 +642,7 @@ async def _terminate_process_group_and_reap(
             status_task=status_task,
             control_write_fd=control_write_fd,
             terminate_write_fd=terminate_write_fd,
+            signal_process_group=signal_process_group,
         )
     )
     while not cleanup_task.done():
@@ -847,6 +855,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         process_group_id: int | None = None
         target_pid: int | None = None
         target_exit_code: int | None = None
+        signal_process_group = True
         try:
             control_read_fd, control_write_fd = os.pipe()
             terminate_read_fd, terminate_write_fd = os.pipe()
@@ -888,10 +897,12 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
             assert proc is not None
             if proc_cancelled:
+                process_info_task = asyncio.create_task(_read_process_group_info(info_read_fd))
                 cleanup_control_fd, control_write_fd = control_write_fd, None
                 cleanup_terminate_fd, terminate_write_fd = terminate_write_fd, None
                 await _terminate_process_group_and_reap(
                     proc,
+                    process_info_task=process_info_task,
                     control_write_fd=cleanup_control_fd,
                     terminate_write_fd=cleanup_terminate_fd,
                 )
@@ -940,10 +951,14 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     else asyncio.wait_for(asyncio.shield(communication_task), communicate_timeout)
                 )
                 communication_task = None
+                # The status protocol means the supervisor has already reaped
+                # the target. From this point on, cleanup must release the
+                # keeper without signaling its possibly reusable group ID.
                 _close_fd_quietly(control_write_fd)
                 control_write_fd = None
                 _close_fd_quietly(terminate_write_fd)
                 terminate_write_fd = None
+                signal_process_group = False
                 wait_timeout = (
                     None
                     if deadline is None
@@ -969,6 +984,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     status_task=status_task,
                     control_write_fd=cleanup_control_fd,
                     terminate_write_fd=cleanup_terminate_fd,
+                    signal_process_group=signal_process_group,
                 )
                 raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
             except asyncio.CancelledError:
@@ -984,6 +1000,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     status_task=status_task,
                     control_write_fd=cleanup_control_fd,
                     terminate_write_fd=cleanup_terminate_fd,
+                    signal_process_group=signal_process_group,
                 )
                 raise
             except Exception:
@@ -999,6 +1016,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                     status_task=status_task,
                     control_write_fd=cleanup_control_fd,
                     terminate_write_fd=cleanup_terminate_fd,
+                    signal_process_group=signal_process_group,
                 )
                 raise
         except ExecTimeoutError:
@@ -1010,6 +1028,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             control_read_fd = None
             _close_fd_quietly(control_write_fd)
             control_write_fd = None
+            _close_fd_quietly(terminate_read_fd)
+            terminate_read_fd = None
             _close_fd_quietly(terminate_write_fd)
             terminate_write_fd = None
             _close_fd_quietly(status_read_fd)

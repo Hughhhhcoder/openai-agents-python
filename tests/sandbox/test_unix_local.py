@@ -9,6 +9,7 @@ import sys
 import tarfile
 import threading
 import time
+from collections.abc import Coroutine
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ from typing import cast
 import pytest
 
 from agents.sandbox import SandboxPathGrant
-from agents.sandbox.errors import PtySessionNotFoundError
+from agents.sandbox.errors import ExecTransportError, PtySessionNotFoundError
 from agents.sandbox.manifest import Environment, Manifest
 from agents.sandbox.sandboxes import unix_local as unix_local_module
 from agents.sandbox.sandboxes.unix_local import (
@@ -371,6 +372,41 @@ async def test_unix_local_exec_uses_spawn_safe_process_group_wrapper(
     assert len(closed_fds) == len(set(closed_fds))
 
 
+@pytest.mark.asyncio
+async def test_unix_local_exec_closes_all_fds_when_process_launch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    closed_fds: list[int] = []
+
+    async def create_subprocess(*_args: object, **_kwargs: object) -> object:
+        raise OSError("launch failed")
+
+    close_fd = unix_local_module._close_fd_quietly
+
+    def record_close(fd: int | None) -> None:
+        if fd is not None:
+            closed_fds.append(fd)
+        close_fd(fd)
+
+    monkeypatch.setattr(unix_local_module.asyncio, "create_subprocess_exec", create_subprocess)
+    monkeypatch.setattr(unix_local_module, "_close_fd_quietly", record_close)
+    session = UnixLocalSandboxSession(
+        state=UnixLocalSandboxSessionState(
+            manifest=Manifest(root=str(workspace)),
+            snapshot=NoopSnapshot(id="noop"),
+        )
+    )
+
+    with pytest.raises(ExecTransportError) as exc_info:
+        await session._exec_internal("echo", "hello")
+
+    assert str(exc_info.value.__cause__) == "launch failed"
+    assert len(closed_fds) == 8
+    assert len(closed_fds) == len(set(closed_fds))
+
+
 @pytest.mark.parametrize(
     ("command", "expected_user"),
     [
@@ -383,6 +419,113 @@ def test_unix_local_exec_extracts_target_user_only_from_command_prefix(
     command: tuple[str, ...], expected_user: str | None
 ) -> None:
     assert unix_local_module._sudo_user_from_command(command) == expected_user
+
+
+@pytest.mark.asyncio
+async def test_unix_local_exec_discovers_process_group_before_startup_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = SimpleNamespace(pid=123, returncode=None)
+    cleanup_kwargs: dict[str, object] = {}
+
+    async def settle(awaitable: object) -> tuple[object, bool]:
+        cast(Coroutine[object, object, object], awaitable).close()
+        return process, True
+
+    async def read_info(_fd: int) -> tuple[int, int]:
+        return 456, 789
+
+    async def cleanup(_process: object, **kwargs: object) -> None:
+        cleanup_kwargs.update(kwargs)
+        info_task = cast(asyncio.Task[tuple[int, int]], kwargs["process_info_task"])
+        assert await info_task == (456, 789)
+
+    monkeypatch.setattr(unix_local_module, "_settle_subprocess_awaitable", settle)
+    monkeypatch.setattr(unix_local_module, "_read_process_group_info", read_info)
+    monkeypatch.setattr(unix_local_module, "_terminate_process_group_and_reap", cleanup)
+    session = UnixLocalSandboxSession(
+        state=UnixLocalSandboxSessionState(
+            manifest=Manifest(root=str(tmp_path)),
+            snapshot=NoopSnapshot(id="noop"),
+        )
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await session._exec_internal("echo", "hello")
+
+    assert cleanup_kwargs["process_info_task"] is not None
+
+
+@pytest.mark.asyncio
+async def test_unix_local_exec_does_not_signal_released_group_after_target_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    killpg_calls: list[tuple[int, int]] = []
+
+    class _Transport:
+        def close(self) -> None:
+            return
+
+    class _Process:
+        pid = 123
+        returncode = None
+        _transport = _Transport()
+        wait_calls = 0
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                wait_started.set()
+                await release_wait.wait()
+            self.returncode = 0
+            return 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+        def kill(self) -> None:
+            raise AssertionError("completed target cleanup should not kill the supervisor")
+
+    process = _Process()
+
+    async def create_subprocess(*_args: object, **_kwargs: object) -> _Process:
+        return process
+
+    async def read_status(_fd: int) -> int:
+        return 0
+
+    async def read_info(_fd: int) -> tuple[int, int]:
+        return 456, 789
+
+    async def read_output(_process: object) -> tuple[bytes, bytes]:
+        return b"", b""
+
+    def record_killpg(group_id: int, signum: int) -> None:
+        killpg_calls.append((group_id, signum))
+
+    monkeypatch.setattr(unix_local_module.asyncio, "create_subprocess_exec", create_subprocess)
+    monkeypatch.setattr(unix_local_module, "_read_process_exit_code", read_status)
+    monkeypatch.setattr(unix_local_module, "_read_process_group_info", read_info)
+    monkeypatch.setattr(unix_local_module, "_read_process_output", read_output)
+    monkeypatch.setattr(unix_local_module.os, "killpg", record_killpg)
+    session = UnixLocalSandboxSession(
+        state=UnixLocalSandboxSessionState(
+            manifest=Manifest(root=str(tmp_path)),
+            snapshot=NoopSnapshot(id="noop"),
+        )
+    )
+
+    task = asyncio.create_task(session._exec_internal("echo", "hello"))
+    await wait_started.wait()
+    task.cancel()
+    release_wait.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert killpg_calls == []
 
 
 @pytest.mark.asyncio
