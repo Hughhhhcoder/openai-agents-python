@@ -712,6 +712,117 @@ async def test_buffer_tool_call_stream_merges_provider_metadata() -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_buffer_tool_call_stream_assigns_index_when_provider_omits_it() -> None:
+    first_delta = ChoiceDeltaToolCall.model_construct(
+        index=None,
+        id="tool-id",
+        function=ChoiceDeltaToolCallFunction(name="my_func", arguments='{"a":'),
+        type="function",
+    )
+    continuation_delta = ChoiceDeltaToolCall.model_construct(
+        index=None,
+        id=None,
+        function=ChoiceDeltaToolCallFunction(name=None, arguments="1}"),
+        type="function",
+    )
+    finish = Choice(
+        index=0,
+        delta=ChoiceDelta(),
+        finish_reason="tool_calls",
+    )
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[first_delta]))],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[continuation_delta]))],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[finish],
+        ),
+    ]
+
+    buffered_chunks = await _collect_buffered_tool_call_chunks(*chunks)
+
+    assert len(buffered_chunks) == 1
+    buffered_tool_call = buffered_chunks[0].choices[0].delta.tool_calls[0]
+    assert buffered_tool_call.index == 0
+    assert buffered_tool_call.id == "tool-id"
+    assert buffered_tool_call.function
+    assert buffered_tool_call.function.arguments == '{"a":1}'
+
+
+@pytest.mark.asyncio
+async def test_buffer_tool_call_stream_orders_indexed_and_unindexed_calls() -> None:
+    indexed_delta = ChoiceDeltaToolCall(
+        index=0,
+        id="indexed-id",
+        function=ChoiceDeltaToolCallFunction(name="indexed", arguments="{}"),
+        type="function",
+    )
+    unindexed_delta = ChoiceDeltaToolCall.model_construct(
+        index=None,
+        id="unindexed-id",
+        function=ChoiceDeltaToolCallFunction(name="unindexed", arguments="{}"),
+        type="function",
+    )
+    unindexed_continuation = ChoiceDeltaToolCall.model_construct(
+        index=None,
+        id=None,
+        function=ChoiceDeltaToolCallFunction(name=None, arguments=""),
+        type="function",
+    )
+    finish = Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[
+                Choice(index=0, delta=ChoiceDelta(tool_calls=[indexed_delta, unindexed_delta]))
+            ],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[unindexed_continuation]))],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[finish],
+        ),
+    ]
+
+    buffered_chunks = await _collect_buffered_tool_call_chunks(*chunks)
+
+    assert len(buffered_chunks) == 1
+    buffered_tool_calls = buffered_chunks[0].choices[0].delta.tool_calls
+    assert buffered_tool_calls
+    assert [(tool_call.index, tool_call.id) for tool_call in buffered_tool_calls] == [
+        (0, "indexed-id"),
+        (1, "unindexed-id"),
+    ]
+
+
 def test_stream_handler_internal_part_stores_text_and_type() -> None:
     part = Part(text="hello", type="output_text")
 

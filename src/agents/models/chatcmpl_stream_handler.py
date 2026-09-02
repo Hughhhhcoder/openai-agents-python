@@ -306,13 +306,58 @@ class ChatCmplStreamHandler:
         return False
 
     @staticmethod
+    def _buffered_tool_call_index(
+        buffered_calls: dict[int, _BufferedToolCall],
+        tool_call_delta: ChoiceDeltaToolCall,
+    ) -> int:
+        """Return a stable integer index for a provider tool-call delta.
+
+        Some OpenAI-compatible providers omit ``index`` for single-call streams. The
+        OpenAI SDK accepts those payloads through its lenient response construction, but
+        the buffered replay path needs an integer index to build a new tool-call model.
+        Prefer a matching call id, then the explicit provider index, and finally the most
+        recently buffered call for an index-less continuation. A fresh synthetic index
+        keeps distinct calls deterministic when an indexed and index-less call coexist.
+        """
+        if tool_call_delta.id:
+            for index, candidate_call in buffered_calls.items():
+                if candidate_call.call_id == tool_call_delta.id:
+                    return index
+
+            unresolved_indexes = [
+                index
+                for index, candidate_call in buffered_calls.items()
+                if candidate_call.call_id is None
+            ]
+            if len(unresolved_indexes) == 1:
+                return unresolved_indexes[0]
+
+        if tool_call_delta.index is not None:
+            indexed_call = buffered_calls.get(tool_call_delta.index)
+            if indexed_call is None or not (
+                tool_call_delta.id
+                and indexed_call.call_id
+                and indexed_call.call_id != tool_call_delta.id
+            ):
+                return tool_call_delta.index
+
+        if tool_call_delta.index is None and not tool_call_delta.id and buffered_calls:
+            return next(reversed(buffered_calls))
+
+        synthetic_index = 0
+        while synthetic_index in buffered_calls:
+            synthetic_index += 1
+        return synthetic_index
+
+    @staticmethod
     def _accumulate_tool_call_delta(
         buffered_calls: dict[int, _BufferedToolCall],
         tool_call_delta: ChoiceDeltaToolCall,
     ) -> None:
+        index = ChatCmplStreamHandler._buffered_tool_call_index(buffered_calls, tool_call_delta)
         buffered_call = buffered_calls.setdefault(
-            tool_call_delta.index,
-            _BufferedToolCall(index=tool_call_delta.index),
+            index,
+            _BufferedToolCall(index=index),
         )
 
         if tool_call_delta.id:
